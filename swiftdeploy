@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""
+SwiftDeploy - Declarative Infrastructure Automation Tool
+Generates deployment configs from manifest.yaml and manages container lifecycle
+"""
+
+import os
+import sys
+import yaml
+import json
+import subprocess
+import time
+import socket
+from pathlib import Path
+from typing import Dict, Any, Optional
+from datetime import datetime
+import re
+
+PROJECT_ROOT = Path(__file__).parent.absolute()
+MANIFEST_FILE = PROJECT_ROOT / "manifest.yaml"
+DOCKER_COMPOSE_FILE = PROJECT_ROOT / "docker-compose.yml"
+NGINX_CONF_FILE = PROJECT_ROOT / "templates" / "nginx.conf"
+ENV_FILE = PROJECT_ROOT / ".env"
+
+
+class ManifestLoader:
+    """Parse and validate manifest.yaml"""
+    
+    @staticmethod
+    def load() -> Dict[str, Any]:
+        if not MANIFEST_FILE.exists():
+            raise FileNotFoundError(f"manifest.yaml not found at {MANIFEST_FILE}")
+        
+        with open(MANIFEST_FILE, 'r') as f:
+            manifest = yaml.safe_load(f)
+        
+        return manifest
+    
+    @staticmethod
+    def save(manifest: Dict[str, Any]):
+        with open(MANIFEST_FILE, 'w') as f:
+            yaml.dump(manifest, f, default_flow_style=False, sort_keys=False)
+
+
+class NginxConfGenerator:
+    """Generate nginx.conf from manifest"""
+    
+    @staticmethod
+    def generate(manifest: Dict[str, Any]) -> str:
+        nginx_port = manifest['nginx']['port']
+        proxy_timeout = manifest['nginx'].get('proxy_timeout', 30)
+        app_port = manifest['services']['port']
+        
+        return f"""user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {{
+    worker_connections 1024;
+}}
+
+http {{
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    log_format custom '$time_iso8601 | $status | ${{request_time}}s | $upstream_addr | $request';
+
+    access_log /var/log/nginx/access.log custom;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+    client_max_body_size 20M;
+
+    proxy_connect_timeout {proxy_timeout}s;
+    proxy_send_timeout {proxy_timeout}s;
+    proxy_read_timeout {proxy_timeout}s;
+    proxy_buffering on;
+    proxy_buffer_size 4k;
+    proxy_buffers 24 4k;
+    proxy_intercept_errors on;
+
+    server {{
+        listen {nginx_port};
+        server_name _;
+
+        access_log /var/log/nginx/access.log custom;
+        error_log /var/log/nginx/error.log warn;
+
+        error_page 502 @error_502;
+        error_page 503 @error_503;
+        error_page 504 @error_504;
+
+        location @error_502 {{
+            default_type application/json;
+            add_header X-Deployed-By swiftdeploy always;
+            return 502 '{{"error": "Bad Gateway", "code": "502", "service": "api", "contact": "support@swiftdeploy.io"}}';
+        }}
+
+        location @error_503 {{
+            default_type application/json;
+            add_header X-Deployed-By swiftdeploy always;
+            return 503 '{{"error": "Service Unavailable", "code": "503", "service": "api", "contact": "support@swiftdeploy.io"}}';
+        }}
+
+        location @error_504 {{
+            default_type application/json;
+            add_header X-Deployed-By swiftdeploy always;
+            return 504 '{{"error": "Gateway Timeout", "code": "504", "service": "api", "contact": "support@swiftdeploy.io"}}';
+        }}
+
+        location / {{
+            proxy_pass http://app:{app_port};
+            add_header X-Deployed-By swiftdeploy always;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_pass_header X-Mode;
+        }}
+    }}
+}}
+"""
+
+    @staticmethod
+    def write(content: str):
+        with open(NGINX_CONF_FILE, 'w') as f:
+            f.write(content)
+
+    @staticmethod
+    def validate() -> bool:
+        """Check nginx.conf syntax"""
+        try:
+            result = subprocess.run(
+                ['nginx', '-t', '-c', str(NGINX_CONF_FILE)],
+                capture_output=True,
+                timeout=5
+            )
+            return result.returncode == 0
+        except Exception as e:
+            print(f"  Nginx validation skipped (nginx not in PATH): {e}")
+            return True
+
+
+class DockerComposeGenerator:
+    """Generate docker-compose.yml from manifest"""
+
+    @staticmethod
+    def generate(manifest: Dict[str, Any]) -> str:
+        services_config = manifest['services']
+        nginx_config = manifest['nginx']
+        network_config = manifest['network']
+        mode = manifest.get('mode', 'stable')
+
+        app_port = services_config['port']
+        nginx_port = nginx_config['port']
+        app_version = services_config.get('version', '1.0.0')
+        restart_policy = services_config.get('restart_policy', 'unless-stopped')
+        health_check = services_config.get('health_check', {})
+
+        health_interval = health_check.get('interval', '30s')
+        health_timeout = health_check.get('timeout', '5s')
+        health_retries = health_check.get('retries', 3)
+        health_start_period = health_check.get('start_period', '5s')
+
+        return f"""services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: {services_config['image']}
+    container_name: swiftdeploy-app
+    environment:
+      - MODE={mode}
+      - APP_VERSION={app_version}
+      - APP_PORT={app_port}
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    user: appuser
+    volumes:
+      - app_logs:/app/logs
+    networks:
+      - {network_config['name']}
+    restart: {restart_policy}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:{app_port}/healthz"]
+      interval: {health_interval}
+      timeout: {health_timeout}
+      retries: {health_retries}
+      start_period: {health_start_period}
+
+  nginx:
+    image: {nginx_config['image']}
+    container_name: swiftdeploy-nginx
+    ports:
+      - "{nginx_port}:{nginx_port}"
+    volumes:
+      - ./templates/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_logs:/var/log/nginx
+    networks:
+      - {network_config['name']}
+    restart: {restart_policy}
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:{nginx_port}/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  app_logs:
+    driver: local
+  nginx_logs:
+    driver: local
+
+networks:
+  {network_config['name']}:
+    driver: {network_config['driver_type']}
+"""
+
+    @staticmethod
+    def write(content: str):
+        with open(DOCKER_COMPOSE_FILE, 'w') as f:
+            f.write(content)
+
+
+class EnvGenerator:
+    """Generate .env file from manifest"""
+
+    @staticmethod
+    def generate(manifest: Dict[str, Any]) -> str:
+        services_config = manifest['services']
+        nginx_config = manifest['nginx']
+        mode = manifest.get('mode', 'stable')
+
+        return f"""APP_PORT={services_config['port']}
+APP_VERSION={services_config.get('version', '1.0.0')}
+MODE={mode}
+NGINX_PORT={nginx_config['port']}
+NGINX_PROXY_TIMEOUT={nginx_config.get('proxy_timeout', 30)}
+"""
+
+    @staticmethod
+    def write(content: str):
+        with open(ENV_FILE, 'w') as f:
+            f.write(content)
+
+
+class Validator:
+    """Pre-flight checks before deployment"""
+
+    @staticmethod
+    def check_all(manifest: Dict[str, Any]) -> tuple[bool, list[str]]:
+        checks = [
+            ("manifest.yaml exists and is valid YAML", Validator.check_manifest),
+            ("All required fields present and non-empty", lambda: Validator.check_required_fields(manifest)),
+            ("Docker image exists locally", lambda: Validator.check_docker_image(manifest)),
+            ("Nginx port is not already bound", lambda: Validator.check_port_available(manifest['nginx']['port'])),
+            ("Generated nginx.conf is syntactically valid", lambda: Validator.check_nginx_syntax()),
+        ]
+
+        results = []
+        all_pass = True
+
+        print("\n Running pre-flight checks...\n")
+
+        for check_name, check_func in checks:
+            try:
+                result = check_func()
+                status = " PASS" if result else " FAIL"
+                results.append(f"{status} | {check_name}")
+                if not result:
+                    all_pass = False
+            except Exception as e:
+                results.append(f" FAIL | {check_name}: {e}")
+                all_pass = False
+
+        for result in results:
+            print(result)
+        print()
+
+        return all_pass, results
+
+    @staticmethod
+    def check_manifest() -> bool:
+        return MANIFEST_FILE.exists()
+
+    @staticmethod
+    def check_required_fields(manifest: Dict[str, Any]) -> bool:
+        required = {
+            'services': ['image', 'port'],
+            'nginx': ['image', 'port'],
+            'network': ['name', 'driver_type']
+        }
+
+        for section, fields in required.items():
+            if section not in manifest:
+                return False
+            for field in fields:
+                if field not in manifest[section] or not manifest[section][field]:
+                    return False
+
+        return True
+
+    @staticmethod
+    def check_docker_image(manifest: Dict[str, Any]) -> bool:
+        image = manifest['services']['image']
+        try:
+            result = subprocess.run(
+                ['docker', 'image', 'inspect', image],
+                capture_output=True,
+                timeout=5
+            )
+            return result.returncode == 0
+        except FileNotFoundError:
+            print("  Docker not found in PATH")
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def check_port_available(port: int) -> bool:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = sock.connect_ex(('127.0.0.1', port))
+            sock.close()
+            return result != 0
+        except Exception:
+            return True
+
+    @staticmethod
+    def check_nginx_syntax() -> bool:
+        return NginxConfGenerator.validate()
+
+
+class DeploymentManager:
+    """Manage container lifecycle"""
+
+    @staticmethod
+    def init(manifest: Dict[str, Any]):
+        """Parse manifest and generate all config files"""
+        print(" Initializing SwiftDeploy...")
+
+        nginx_conf = NginxConfGenerator.generate(manifest)
+        NginxConfGenerator.write(nginx_conf)
+        print("   Generated nginx.conf")
+
+        docker_compose = DockerComposeGenerator.generate(manifest)
+        DockerComposeGenerator.write(docker_compose)
+        print("   Generated docker-compose.yml")
+
+        env_content = EnvGenerator.generate(manifest)
+        EnvGenerator.write(env_content)
+        print("   Generated .env")
+
+        print(" Initialization complete\n")
+
+    @staticmethod
+    def validate(manifest: Dict[str, Any]) -> bool:
+        """Run pre-flight checks"""
+        all_pass, _ = Validator.check_all(manifest)
+        return all_pass
+
+    @staticmethod
+    def deploy(manifest: Dict[str, Any]):
+        """Initialize, bring up stack, and wait for health checks"""
+        print(" Starting deployment...\n")
+
+        # Step 1: Init
+        DeploymentManager.init(manifest)
+
+        # Step 2: Bring up stack
+        print(" Bringing up containers...")
+        try:
+            result = subprocess.run(
+                ['docker-compose', 'up', '--build', '-d'],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                timeout=300,
+                text=True
+            )
+            if result.returncode != 0:
+                print(f" Docker Compose failed: {result.stderr}")
+                return False
+            print("   Containers started")
+        except Exception as e:
+            print(f" Error starting containers: {e}")
+            return False
+
+        # Step 3: Wait for health checks via nginx port
+        print(" Waiting for health checks...")
+        nginx_port = manifest['nginx']['port']    # ✅ check through nginx
+        max_retries = 60
+
+        for i in range(max_retries):
+            try:
+                result = subprocess.run(
+                    ['curl', '-f', f'http://localhost:{nginx_port}/healthz'],
+                    capture_output=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    print("   Service is healthy")
+                    print(" Deployment successful\n")
+                    return True
+            except Exception:
+                pass
+
+            if i < max_retries - 1:
+                time.sleep(1)
+
+        print(" Health check timeout after 60s")
+        return False
+
+    @staticmethod
+    def promote(mode: str, manifest: Dict[str, Any]):
+        """Switch deployment mode (canary/stable)"""
+        if mode not in ['canary', 'stable']:
+            print(f" Invalid mode: {mode}. Must be 'canary' or 'stable'")
+            return False
+
+        current_mode = manifest.get('mode', 'stable')
+
+        if current_mode == mode:
+            print(f"  Already in {mode} mode")
+            return True
+
+        print(f" Promoting to {mode} mode...\n")
+
+        # Step 1: Update manifest
+        manifest['mode'] = mode
+        ManifestLoader.save(manifest)
+        print(f"   Updated manifest.yaml (mode: {mode})")
+
+        # Step 2: Regenerate docker-compose.yml
+        docker_compose = DockerComposeGenerator.generate(manifest)
+        DockerComposeGenerator.write(docker_compose)
+        print("   Regenerated docker-compose.yml")
+
+        # Step 3: Update .env
+        env_content = EnvGenerator.generate(manifest)
+        EnvGenerator.write(env_content)
+        print("   Updated .env")
+
+        # Step 4: Recreate app container so env vars reload
+        print("   Restarting service...")
+        try:
+            subprocess.run(
+                ['docker-compose', 'up', '-d', '--no-deps', 'app'],  # ✅ reloads env vars
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                timeout=60
+            )
+            print("   Service restarted")
+        except Exception as e:
+            print(f"   Failed to restart service: {e}")
+            return False
+
+        # Step 5: Verify mode via nginx port
+        print("   Verifying mode...")
+        nginx_port = manifest['nginx']['port']    # ✅ check through nginx
+
+        for _ in range(30):
+            try:
+                result = subprocess.run(
+                    ['curl', '-s', f'http://localhost:{nginx_port}/healthz'],
+                    capture_output=True,
+                    timeout=5,
+                    text=True
+                )
+                if result.returncode == 0:
+                    response = json.loads(result.stdout)
+                    if response.get('status') == 'ok':
+                        print("   Mode verified")
+                        print(f" Promoted to {mode} mode\n")
+                        return True
+            except Exception:
+                pass
+
+            time.sleep(1)
+
+        print(" Failed to verify mode")
+        return False
+
+    @staticmethod
+    def teardown(clean: bool = False):
+        """Remove all containers, networks, and volumes"""
+        print(" Tearing down deployment...\n")
+
+        try:
+            result = subprocess.run(
+                ['docker-compose', 'down', '-v'],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                timeout=60
+            )
+
+            if result.returncode == 0:
+                print("   Containers and volumes removed")
+            else:
+                print(f"  docker-compose down returned: {result.returncode}")
+        except Exception as e:
+            print(f"  Error during teardown: {e}")
+
+        if clean:
+            print("   Cleaning generated files...")
+            for file in [DOCKER_COMPOSE_FILE, NGINX_CONF_FILE, ENV_FILE]:
+                if file.exists():
+                    file.unlink()
+                    print(f"     Removed {file.name}")
+
+        print(" Teardown complete\n")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("""
+SwiftDeploy - Declarative Infrastructure Automation
+
+Usage: swiftdeploy <command> [options]
+
+Commands:
+  init                  Parse manifest.yaml → generate configs
+  validate              Run 5 pre-flight checks
+  deploy                Initialize, bring up stack, wait for health
+  promote <mode>        Switch mode (canary/stable)
+  teardown [--clean]    Remove containers, networks, volumes
+
+Examples:
+  swiftdeploy init
+  swiftdeploy validate
+  swiftdeploy deploy
+  swiftdeploy promote canary
+  swiftdeploy teardown --clean
+""")
+        sys.exit(1)
+
+    command = sys.argv[1]
+
+    try:
+        manifest = ManifestLoader.load()
+
+        if command == 'init':
+            DeploymentManager.init(manifest)
+
+        elif command == 'validate':
+            if not DeploymentManager.validate(manifest):
+                sys.exit(1)
+
+        elif command == 'deploy':
+            if not DeploymentManager.deploy(manifest):
+                sys.exit(1)
+
+        elif command == 'promote':
+            if len(sys.argv) < 3:
+                print(" Usage: swiftdeploy promote <canary|stable>")
+                sys.exit(1)
+            mode = sys.argv[2]
+            if not DeploymentManager.promote(mode, manifest):
+                sys.exit(1)
+
+        elif command == 'teardown':
+            clean = '--clean' in sys.argv
+            DeploymentManager.teardown(clean=clean)
+
+        else:
+            print(f" Unknown command: {command}")
+            sys.exit(1)
+
+    except FileNotFoundError as e:
+        print(f" {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f" Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

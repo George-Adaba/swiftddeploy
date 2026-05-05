@@ -1,0 +1,19 @@
+services:
+  image: swift-deploy-1-node:latest
+  port: 8000
+  version: 1.0.2
+  restart_policy: unless-stopped
+  health_check:
+    path: /healthz
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 5s
+nginx:
+  image: nginx:alpine
+  port: 8080
+  proxy_timeout: 30
+network:
+  name: swiftdeploy-net
+  driver_type: bridge
+mode: canary
