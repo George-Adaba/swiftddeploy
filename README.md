@@ -103,34 +103,36 @@ Stable mode runs without the X-Mode header.
 ### teardown
 Stops and removes all containers, networks, and volumes.
 
-# Keep generated files
+#### Keep generated files
 python swiftdeploy teardown
 
-# Also delete generated configs
+#### Also delete generated configs
 python swiftdeploy teardown --clean
 
 ## API Endpoints
 
 `/GET     Welcome message with mode, version, timestamp`
-`/healthz Liveness check with status and uptime` 
+
+`/healthz Liveness check with status and uptime`
+ 
 `/chaos   Inject failure modes for testing` 
 
 ### Chaos modes
 
-# Slow mode — adds N second delay to all requests
+#### Slow mode — adds N second delay to all requests
 ```
 curl -X POST http://localhost:8080/chaos \
   -H "Content-Type: application/json" \
   -d '{"mode": "slow", "duration": 5}'
 ```
 
-# Error mode — returns 500 on X% of requests
+#### Error mode — returns 500 on X% of requests
 ```
 curl -X POST http://localhost:8080/chaos \
   -H "Content-Type: application/json" \
   -d '{"mode": "error", "rate": 0.5}'
 ```
-# Recover — cancels any active chaos
+#### Recover — cancels any active chaos
 ```
 curl -X POST http://localhost:8080/chaos \
   -H "Content-Type: application/json" \
